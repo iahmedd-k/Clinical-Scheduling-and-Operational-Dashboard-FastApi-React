@@ -1,0 +1,148 @@
+﻿from fastapi import APIRouter, Depends, Query, Response, status
+from sqlalchemy.orm import Session
+
+from app.core.dependencies import get_db
+from app.core.authorization import require_permission, Permission, SlotOwnershipGuard
+from app.core.exceptions import (
+    NotFoundError,
+    SlotNotFoundError,
+    ConflictError,
+    ValidationError,
+)
+from app.models import SlotStatus, User, UserRole
+from app.repositories import ProviderRepository, SlotRepository
+from app.schemas.domain import PaginatedResponse, SlotCreate, SlotRead
+from app.services import SlotService
+from app.services.healthcare_event_service import HealthcareEventService
+
+router = APIRouter(prefix="/slots", tags=["slots"])
+
+
+@router.post(
+    "",
+    response_model=SlotRead,
+    status_code=status.HTTP_200_OK,
+    summary="Create slot",
+    description="Creates a new availability slot for a provider/service combination. Restricted to admin, front desk, and provider roles.",
+)
+def create_slot(
+    payload: SlotCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_CREATE)),
+):
+    repository = SlotRepository(db)
+    provider = ProviderRepository(db).get_by_id(payload.provider_id)
+    if not provider:
+        raise NotFoundError("Provider not found", code="PROVIDER_NOT_FOUND")
+    SlotOwnershipGuard(current_user, provider).enforce()
+    if not repository.validate_provider_and_service(payload.provider_id, payload.service_id):
+        raise NotFoundError("Provider or service not found", code="PROVIDER_OR_SERVICE_NOT_FOUND")
+    slot = repository.create_slot(payload.model_dump())
+    HealthcareEventService(db).publish_resource_event(
+        "slot.created",
+        entity_type="slot",
+        entity_id=slot.id,
+        provider_id=slot.provider_id,
+        service_id=slot.service_id,
+        status=slot.status.value,
+    )
+    return slot
+
+
+@router.get(
+    "/providers/{provider_id}",
+    response_model=PaginatedResponse[SlotRead],
+    summary="List slots by provider",
+    description="Returns a paginated list of slots offered by a specific provider. Patients see AVAILABLE only; providers see own slots; admin/front desk see all.",
+)
+def list_slots_by_provider(
+    provider_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_READ)),
+):
+    svc = SlotService(db)
+    items, total = svc.list_slots_by_provider(
+        provider_id=provider_id, offset=offset, limit=limit, current_user=current_user
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get(
+    "",
+    response_model=PaginatedResponse[SlotRead],
+    summary="List slots",
+    description="Returns a paginated list of slots, filtered for patient availability when applicable.",
+)
+def list_slots(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_READ)),
+):
+    svc = SlotService(db)
+    items, total = svc.list_slots(offset=offset, limit=limit, current_user=current_user)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get(
+    "/{slot_id}",
+    response_model=SlotRead,
+    summary="Get slot by ID",
+    description="Returns a single slot detail. Patients may only view AVAILABLE slots.",
+)
+def get_slot(
+    slot_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_READ)),
+):
+    svc = SlotService(db)
+    return svc.get_slot(slot_id=slot_id, current_user=current_user)
+
+
+@router.patch(
+    "/{slot_id}",
+    response_model=SlotRead,
+    summary="Update availability slot",
+)
+def update_slot(
+    slot_id: int,
+    payload: SlotCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_UPDATE)),
+):
+    slot = SlotRepository(db).get_by_id(slot_id)
+    if not slot:
+        raise SlotNotFoundError()
+    SlotOwnershipGuard(current_user, slot).enforce()
+    if slot.status != SlotStatus.AVAILABLE:
+        raise ConflictError("Booked slots cannot be edited", code="SLOT_NOT_EDITABLE")
+    if payload.provider_id != slot.provider_id or payload.patient_id is not None or payload.status != SlotStatus.AVAILABLE:
+        raise ValidationError("Only an available slot schedule can be edited", code="INVALID_SLOT_UPDATE")
+    if payload.end_datetime <= payload.start_datetime:
+        raise ValidationError("End time must be after start time", code="INVALID_SLOT_TIME")
+    return SlotRepository(db).update_slot(
+        slot, payload.model_dump(exclude={"provider_id", "patient_id", "status"})
+    )
+
+
+@router.delete(
+    "/{slot_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete availability slot",
+)
+def delete_slot(
+    slot_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission(Permission.SLOT_DELETE)),
+):
+    repository = SlotRepository(db)
+    slot = repository.get_by_id(slot_id)
+    if not slot:
+        raise SlotNotFoundError()
+    SlotOwnershipGuard(current_user, slot).enforce()
+    if slot.status != SlotStatus.AVAILABLE:
+        raise ConflictError("Booked slots cannot be deleted", code="SLOT_NOT_DELETABLE")
+    repository.delete_slot(slot)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
